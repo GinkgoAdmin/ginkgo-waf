@@ -27,6 +27,30 @@ database_dump=''
 failed_image_tag=''
 fresh_cleanup=false
 fail() { printf 'ERROR: %s\n' "$*" >&2; exit 1; }
+DETECTED_BASE=''
+if command -v ps >/dev/null 2>&1; then
+  while IFS= read -r detected_line; do
+    if [[ "$detected_line" == *curl* && "$detected_line" =~ (https?://[^[:space:]\"\'<>]+)/manager\.sh ]]; then
+      DETECTED_BASE=${BASH_REMATCH[1]}
+      break
+    fi
+  done < <(ps -eo args= 2>/dev/null || true)
+fi
+apply_base_url() {
+  local value=$1 hostport port
+  while [[ "$value" == */ ]]; do value=${value%/}; done
+  [[ "$value" =~ ^https?://[A-Za-z0-9.-]+(:[0-9]+)?(/[A-Za-z0-9._~%+-]+)*$ ]] || return 1
+  hostport=${value#*://}
+  hostport=${hostport%%/*}
+  if [[ "$hostport" == *:* ]]; then
+    port=${hostport##*:}
+    [[ "$port" =~ ^[0-9]+$ ]] || return 1
+    port=$((10#$port))
+    [[ "$port" -ge 1 && "$port" -le 65535 ]] || return 1
+  fi
+  BASE_URL=$value
+  if [[ "$value" == http://* ]]; then ALLOW_HTTP=1; fi
+}
 run_compose() {
   local runtime="$install_dir/.runtime/$environment/.env"
   local args
@@ -393,6 +417,7 @@ check_database_runtime() {
 }
 
 main() {
+base_from_arg=false
 while (($#)); do
   case "$1" in
     menu|install|update|uninstall|info|rename-admin|reset-password|schema|status|start|stop|doctor|credentials|apply-ports|host-agent-install|host-agent-remove|host-scan|host-fix|host-fix-all|host-history) action=$1; shift ;;
@@ -401,10 +426,18 @@ while (($#)); do
     --upgrade) upgrade=true; shift ;;
     --purge-data) purge_data=true; shift ;;
     --no-start) no_start=true; shift ;;
-    --help|-h) echo 'Usage: manager.sh [menu|install|update|uninstall|info|rename-admin|reset-password|schema|status|start|stop|doctor|credentials|apply-ports|host-agent-install|host-agent-remove|host-scan|host-fix|host-fix-all|host-history] [--environment production|staging|development] [--install-dir /opt/ginkgo-waf] [--upgrade] [--purge-data] [--no-start]'; exit 0 ;;
+    --base-url) [[ -n "${2:-}" ]] || fail '缺少下载地址'; apply_base_url "$2" || fail '下载地址只能是不带账号、参数和片段的 HTTP 或 HTTPS 地址，端口范围为 1 到 65535'; base_from_arg=true; shift 2 ;;
+    --help|-h) echo 'Usage: manager.sh [menu|install|update|uninstall|info|rename-admin|reset-password|schema|status|start|stop|doctor|credentials|apply-ports|host-agent-install|host-agent-remove|host-scan|host-fix|host-fix-all|host-history] [--environment production|staging|development] [--install-dir /opt/ginkgo-waf] [--base-url URL] [--upgrade] [--purge-data] [--no-start]'; exit 0 ;;
     *) fail "Unknown option: $1" ;;
   esac
 done
+if [[ "$base_from_arg" == false && -n "${GINKGO_WAF_BASE_URL:-}" ]]; then
+  apply_base_url "$GINKGO_WAF_BASE_URL" || fail '下载地址只能是不带账号、参数和片段的 HTTP 或 HTTPS 地址，端口范围为 1 到 65535'
+  base_from_arg=true
+fi
+if [[ "$base_from_arg" == false && -n "$DETECTED_BASE" ]]; then
+  apply_base_url "$DETECTED_BASE" || true
+fi
 [[ $EUID -eq 0 ]] || fail '请使用root账号执行，或用sudo运行此脚本。'
 if $purge_data && [[ "$action" != menu && "$action" != install && "$action" != uninstall ]]; then
   fail '--purge-data 只能用于 install 或 uninstall'
