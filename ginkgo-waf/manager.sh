@@ -1,0 +1,796 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+umask 077
+BASE_URL='https://waf.gs25.top/ginkgo-waf'
+ALLOW_HTTP=0
+PACKAGE='ginkgo-waf-0.1.0-linux-amd64.tar.gz'
+PACKAGE_SHA256='764d1b6796cc8a0bbd206d18fccdfee5c88cb8c15035166010e1059b7da93cda'
+PROGRAM_PACKAGE='ginkgo-waf-program-d39adcb0c1833317.tar.gz'
+PROGRAM_SHA256='d39adcb0c1833317553660e45d684d059fa15532bc6f693285b5a9c35e4fa2e4'
+UPDATE_BASE=''
+UPDATE_TARGET=''
+ARCHIVE_ROOT='ginkgo-waf-0.1.0'
+action=menu
+environment=production
+install_dir=/opt/ginkgo-waf
+upgrade=false
+full_update=false
+purge_data=false
+no_start=false
+workdir=''
+staged_fresh=false
+kept_runtime=false
+rollback_dir=''
+previous_image_tag=''
+loaded_update_tag=''
+database_dump=''
+failed_image_tag=''
+fresh_cleanup=false
+fail() { printf 'ERROR: %s\n' "$*" >&2; exit 1; }
+run_compose() {
+  local runtime="$install_dir/.runtime/$environment/.env"
+  local args
+  [[ -s "$runtime" && -f "$install_dir/compose.yaml" ]] || return 1
+  args=(docker compose --project-name "unitwaf-$environment" --project-directory "$install_dir" --env-file "$runtime" -f "$install_dir/compose.yaml")
+  if [[ -f "$install_dir/compose.bundle.yaml" ]] && grep -q '^COMPOSE_BUNDLE=true$' "$runtime"; then
+    args+=(-f "$install_dir/compose.bundle.yaml")
+  fi
+  if [[ -f "$install_dir/compose.development.yaml" && "$environment" == development ]]; then
+    args+=(-f "$install_dir/compose.development.yaml")
+  fi
+  if [[ -f "$install_dir/.runtime/$environment/ports.compose.json" ]]; then
+    args+=(-f "$install_dir/.runtime/$environment/ports.compose.json")
+  fi
+  "${args[@]}" "$@"
+}
+run_manage_host() { bash "$install_dir/scripts/manage.sh" --environment "$environment" host-agent "$@"; }
+host_command() { bash "$install_dir/scripts/manage.sh" --environment "$environment" host "$@"; }
+host_menu() {
+  local change
+  printf '\n主机安全\n1. 安装或更新主机代理\n2. 扫描主机安全隐患\n3. 一键修复（只处理不影响登录和网络的项目）\n4. 一键修复（包含 SSH、防火墙等需确认的项目）\n5. 查看修复记录\n6. 回滚一次修复\n7. 移除主机代理\n0. 返回\n' >&7
+  choose_key '请选择数字：' '|0|1|2|3|4|5|6|7|' || return 1
+  case "$REPLY" in
+    1) run_manage_host install ;;
+    2) host_command scan ;;
+    3)
+      host_command scan
+      confirm '确认修复上面列出的项目？' || return 0
+      host_command fix --yes
+      ;;
+    4)
+      host_command scan
+      prompt_out $'这会修改 SSH 登录、防火墙等设置。请先确认还有其他登录方式（例如云服务器控制台）。\n'
+      confirm '确认执行全部修复？' || return 0
+      host_command fix --all --yes
+      ;;
+    5) host_command history ;;
+    6)
+      host_command history
+      prompt_out '输入要回滚的修复编号：'
+      IFS= read -r change <&7 || return 1
+      [[ "$change" =~ ^[0-9]{14}-[a-f0-9]{8}$ ]] || fail '修复编号格式不正确'
+      host_command rollback "$change"
+      ;;
+    7)
+      confirm '确认移除主机代理？修复记录会保留。' || return 0
+      run_manage_host remove
+      ;;
+  esac
+}
+bundle_image_names() {
+  local tag=$1 name
+  [[ "$tag" =~ ^[0-9]+\.[0-9]+\.[0-9]+-[a-f0-9]{64}$ ]] || return 0
+  for name in app-production app-development crs postgres; do
+    printf '%s\n' "ginkgo-bundle/${name}:${tag}"
+  done
+}
+remove_bundle_images() {
+  local image
+  command -v docker >/dev/null 2>&1 || return 0
+  while IFS= read -r image; do
+    [[ -n "$image" ]] || continue
+    docker image rm -f -- "$image" >/dev/null 2>&1 || true
+  done < <(bundle_image_names "$1")
+}
+leftover_bundle_images() {
+  local image
+  command -v docker >/dev/null 2>&1 || return 0
+  while IFS= read -r image; do
+    [[ -n "$image" ]] || continue
+    if docker image inspect -- "$image" >/dev/null 2>&1; then
+      printf '%s\n' "$image"
+    fi
+  done < <(bundle_image_names "$1")
+}
+database_save() {
+  run_compose up -d --no-deps --no-build --wait --wait-timeout 120 db >/dev/null
+  run_compose exec -T db sh -ec 'export PGPASSWORD="$POSTGRES_PASSWORD"; exec pg_dump -U "$POSTGRES_USER" -d "$POSTGRES_DB" --format=custom --no-owner --no-privileges' > "$1"
+}
+database_load() {
+  run_compose up -d --no-deps --no-build --wait --wait-timeout 120 db >/dev/null
+  run_compose exec -T db sh -ec 'export PGPASSWORD="$POSTGRES_PASSWORD"; exec pg_restore -U "$POSTGRES_USER" -d "$POSTGRES_DB" --clean --if-exists --no-owner --no-privileges --exit-on-error' < "$1"
+}
+discard_unfinished_install() {
+  local tag=''
+  if [[ -f "$install_dir/bundle/image-tag" && ! -L "$install_dir/bundle/image-tag" ]]; then
+    tag=$(tr -d '[:space:]' < "$install_dir/bundle/image-tag")
+  fi
+  failed_image_tag=$tag
+  run_compose --profile '*' down --volumes --remove-orphans >/dev/null 2>&1 || true
+  remove_bundle_images "$tag"
+  [[ -d "$install_dir" && ! -L "$install_dir" && "$install_dir" == /* && "$install_dir" != / && "$install_dir" != /opt && "$install_dir" != /usr && "$install_dir" != /etc && "$install_dir" != /var && "$install_dir" != /home ]] || return 0
+  rm -rf -- "$install_dir" || true
+}
+report_fresh_leftovers() {
+  local image images=() directory_left=false
+  if [[ -d "$install_dir" && ! -L "$install_dir" ]]; then
+    directory_left=true
+  fi
+  if [[ -n "$failed_image_tag" ]]; then
+    while IFS= read -r image; do
+      [[ -n "$image" ]] && images+=("$image")
+    done < <(leftover_bundle_images "$failed_image_tag")
+  fi
+  if [[ "$directory_left" == false && ${#images[@]} -eq 0 ]]; then
+    printf '已删除本次下载、压缩包、未完成的安装文件和本次载入的镜像。\n' >&2
+    return 0
+  fi
+  printf '以下内容未能自动删除，请手动删除：\n' >&2
+  if [[ "$directory_left" == true ]]; then
+    printf '  rm -rf -- %q\n' "$install_dir" >&2
+  fi
+  if ((${#images[@]})); then
+    printf '  docker image rm -f' >&2
+    for image in "${images[@]}"; do
+      printf ' %q' "$image" >&2
+    done
+    printf '\n' >&2
+  fi
+}
+restore_failed_update() {
+  local new_tag='' item base
+  [[ -d "$rollback_dir" && ! -L "$rollback_dir" && "$rollback_dir" == /tmp/unitwaf-rollback.* ]] || return 0
+  if [[ -f "$install_dir/bundle/image-tag" && ! -L "$install_dir/bundle/image-tag" ]]; then
+    new_tag=$(tr -d '[:space:]' < "$install_dir/bundle/image-tag")
+  fi
+  run_compose --profile '*' down --remove-orphans >/dev/null 2>&1 || true
+  shopt -s dotglob nullglob
+  for item in "$install_dir"/*; do
+    base=${item##*/}
+    [[ -e "$rollback_dir/$base" ]] || rm -rf -- "$item"
+  done
+  shopt -u dotglob nullglob
+  cp -a "$rollback_dir/." "$install_dir/"
+  if [[ -n "$new_tag" && "$new_tag" != "$previous_image_tag" ]]; then
+    remove_bundle_images "$new_tag"
+  fi
+  if ! bash "$install_dir/scripts/manage.sh" --environment "$environment" start; then
+    printf '已退回更新前的程序、配置和镜像，但旧服务启动失败。请排除上方错误后重试。\n' >&2
+  fi
+  rm -rf -- "$rollback_dir"
+  rollback_dir=''
+  printf '更新未完成，已退回更新前的状态。\n' >&2
+}
+cleanup() {
+  local status=$? removed_download=false
+  if [[ "$workdir" == /tmp/unitwaf-bootstrap.* && -d "$workdir" && ! -L "$workdir" ]]; then
+    rm -rf -- "$workdir"
+    removed_download=true
+  fi
+  if [[ $status -ne 0 && -n "$rollback_dir" ]]; then
+    restore_failed_update || true
+  elif [[ $status -ne 0 && "$staged_fresh" == true && "$kept_runtime" != true ]]; then
+    discard_unfinished_install || true
+    fresh_cleanup=true
+  elif [[ $status -ne 0 && "$removed_download" == true ]]; then
+    printf '已删除本次下载的安装包。\n' >&2
+  elif [[ $status -eq 0 && -n "$rollback_dir" ]]; then
+    rm -rf -- "$rollback_dir"
+    rollback_dir=''
+  fi
+  if [[ $status -ne 0 && -n "$loaded_update_tag" && "$loaded_update_tag" != "$previous_image_tag" ]]; then
+    remove_bundle_images "$loaded_update_tag" || true
+  fi
+  if [[ $status -ne 0 && -n "$database_dump" && -s "$database_dump" ]]; then
+    database_load "$database_dump" || printf '数据库未能退回更新前的内容。\n' >&2
+  fi
+  if [[ -n "$database_dump" && -f "$database_dump" ]]; then
+    rm -f -- "$database_dump"
+    database_dump=''
+  fi
+  if [[ "$fresh_cleanup" == true ]]; then
+    report_fresh_leftovers || true
+  fi
+}
+install_interrupted() {
+  if [[ -n "$rollback_dir" ]]; then
+    printf '更新未完成，正在退回更新前的状态。\n' >&2
+  elif [[ "$staged_fresh" == true && "$kept_runtime" != true ]]; then
+    printf '安装未完成。\n' >&2
+  else
+    printf '安装未完成；已保留现有凭证和数据。修复错误后可重试。\n' >&2
+  fi
+}
+trap cleanup EXIT
+trap install_interrupted ERR
+# BEGIN install prompt
+prompt_out() { printf '%s' "$*" >&7; }
+
+read_prompt_key() {
+  local key
+  IFS= read -rsn1 key <&7 || return 1
+  if [[ "$key" == $'\e' ]]; then
+    IFS= read -rsn2 -t 0.01 _ <&7 || true
+    key=''
+  fi
+  REPLY=$key
+}
+
+choose_key() {
+  local prompt=$1 allowed=$2 choice='' shown=0 key
+  prompt_out "$prompt"
+  while :; do
+    read_prompt_key || return 1
+    key=$REPLY
+    if [[ -z "$key" || "$key" == $'\n' || "$key" == $'\r' ]]; then
+      prompt_out $'\n'
+      if [[ -z "$choice" ]]; then
+        prompt_out $'请重新选择。\n'"$prompt"
+        continue
+      fi
+      REPLY=$choice
+      return 0
+    fi
+    [[ "$key" == $'\x7f' || "$key" == $'\b' ]] && continue
+    [[ "$allowed" == *"|$key|"* ]] || continue
+    if [[ "$shown" == 1 ]]; then prompt_out $'\b'; fi
+    prompt_out "$key"
+    choice=$key
+    shown=1
+  done
+}
+
+confirm() {
+  local choice=y key
+  prompt_out "$1 [Y/n] Y"
+  while :; do
+    read_prompt_key || return 1
+    key=$REPLY
+    case "$key" in
+      ''|$'\n'|$'\r')
+        prompt_out $'\n'
+        if [[ "$choice" == y ]]; then return 0; fi
+        return 1
+        ;;
+      y|Y) prompt_out $'\bY'; choice=y ;;
+      n|N) prompt_out $'\bN'; choice=n ;;
+    esac
+  done
+}
+
+port_in_use() {
+  local port=$1 listing='' line local_address current
+  if [[ -n "${UNITWAF_PORT_LISTENERS:-}" ]]; then
+    listing=$(cat -- "$UNITWAF_PORT_LISTENERS")
+  elif command -v ss >/dev/null 2>&1; then
+    listing=$(ss -H -ltn 2>/dev/null || true)
+  else
+    awk -v port="$port" 'BEGIN { p = sprintf("%04X", port) }
+      $4 == "0A" && toupper($2) ~ ":" p "$" { found = 1 }
+      END { exit !found }' /proc/net/tcp /proc/net/tcp6 2>/dev/null
+    return
+  fi
+  while IFS= read -r line; do
+    [[ -n "$line" ]] || continue
+    read -r _ _ _ local_address _ <<< "$line"
+    current=${local_address##*:}
+    [[ "$current" == "$port" ]] && return 0
+  done <<< "$listing"
+  return 1
+}
+
+prompt_admin_port() {
+  local current=${1:-18000} entered
+  while :; do
+    prompt_out '管理界面端口：'
+    if ! IFS= read -r -e -i "$current" entered <&7; then
+      return 1
+    fi
+    current=$entered
+    if [[ ! "$current" =~ ^[0-9]+$ ]] || ((10#$current < 1 || 10#$current > 65535)); then
+      prompt_out $'请输入 1–65535 的端口。\n'
+      current=18000
+      continue
+    fi
+    current=$((10#$current))
+    if port_in_use "$current"; then
+      prompt_out $'端口已被其它应用占用，请更换端口。\n'
+      continue
+    fi
+    REPLY=$current
+    return 0
+  done
+}
+# END install prompt
+
+retained_install() {
+  [[ -s "$install_dir/.runtime/$environment/.env" ]] && return 0
+  [[ -f "$install_dir/.unitwaf-install" ]] || return 1
+  command -v docker >/dev/null 2>&1 || return 1
+  local volumes
+  volumes=$(docker volume ls -q --filter "label=com.docker.compose.project=unitwaf-$environment") || fail '无法读取 Docker 数据卷，请确认 Docker 正在运行。'
+  [[ -n "$volumes" ]]
+}
+
+purge_environment_data() {
+  local runtime="$install_dir/.runtime/$environment/.env"
+  local runtime_dir="$install_dir/.runtime/$environment"
+  local project="unitwaf-$environment"
+  local container volume network containers volumes networks
+  trap 'printf "移除数据未完成。请排除上方错误后重新执行。\n" >&2' ERR
+  command -v docker >/dev/null 2>&1 || fail '未找到 Docker，无法移除数据卷。'
+  if [[ -s "$runtime" && -f "$install_dir/compose.yaml" ]]; then
+    local compose=(docker compose --project-name "$project" --project-directory "$install_dir" --env-file "$runtime" -f "$install_dir/compose.yaml")
+    if [[ -f "$install_dir/compose.bundle.yaml" ]] && grep -q '^COMPOSE_BUNDLE=true$' "$runtime"; then
+      compose+=(-f "$install_dir/compose.bundle.yaml")
+    fi
+    if [[ -f "$install_dir/compose.development.yaml" && "$environment" == development ]]; then
+      compose+=(-f "$install_dir/compose.development.yaml")
+    fi
+    if [[ -f "$runtime_dir/ports.compose.json" ]]; then
+      compose+=(-f "$runtime_dir/ports.compose.json")
+    fi
+    "${compose[@]}" --profile '*' down --volumes --remove-orphans
+  fi
+  containers=$(docker ps -aq --filter "label=com.docker.compose.project=$project") || fail '无法读取 Docker 容器。'
+  while IFS= read -r container; do
+    [[ -n "$container" ]] || continue
+    docker rm -f -- "$container" >/dev/null
+  done <<< "$containers"
+  volumes=$(docker volume ls -q --filter "label=com.docker.compose.project=$project") || fail '无法读取 Docker 数据卷。'
+  while IFS= read -r volume; do
+    [[ -n "$volume" ]] || continue
+    docker volume rm -- "$volume" >/dev/null
+  done <<< "$volumes"
+  networks=$(docker network ls -q --filter "label=com.docker.compose.project=$project") || fail '无法读取 Docker 网络。'
+  while IFS= read -r network; do
+    [[ -n "$network" ]] || continue
+    docker network rm -- "$network" >/dev/null
+  done <<< "$networks"
+  if [[ -f "$install_dir/scripts/host_guard.sh" ]]; then
+    bash "$install_dir/scripts/host_guard.sh" remove "$environment"
+  fi
+  if [[ -d "$runtime_dir" && ! -L "$runtime_dir" && "$runtime_dir" == "$install_dir/.runtime/$environment" ]]; then
+    rm -rf -- "$runtime_dir"
+  fi
+  trap install_interrupted ERR
+  printf '已移除该环境的账号、配置和业务数据。\n'
+}
+
+image_runtime_id() {
+  local payload
+  payload=$(docker image inspect --format '{{.Os}}/{{.Architecture}}{{"\n"}}{{range .RootFS.Layers}}{{.}}{{"\n"}}{{end}}' "$1" 2>/dev/null) || return 1
+  [[ -n "$payload" ]] || return 1
+  printf '%s\n' "$payload" | sha256sum | awk '{print "sha256:"$1}'
+}
+
+postgres_image_id() {
+  awk '$1 ~ /^ginkgo-bundle\/postgres:/ {print $2}' "$1/images.list"
+}
+
+check_database_runtime() {
+  local current candidate containers container
+  current=$(postgres_image_id "$1")
+  candidate=$(postgres_image_id "$2")
+  [[ "$current" =~ ^sha256:[a-f0-9]{64}$ && "$candidate" == "$current" ]] ||
+    fail 'PostgreSQL 镜像与现有数据库环境不同。请先执行独立的数据库迁移，再更新程序。'
+  containers=$(docker ps -aq --filter "label=com.docker.compose.project=unitwaf-$environment" \
+    --filter 'label=com.docker.compose.service=db')
+  for container in $containers; do
+    [[ $(image_runtime_id "$(docker inspect --format '{{.Image}}' "$container")") == "$current" ]] ||
+      fail '数据库容器使用了与镜像清单不同的 PostgreSQL 镜像。请先确认数据库环境。'
+  done
+}
+
+main() {
+while (($#)); do
+  case "$1" in
+    menu|install|update|uninstall|info|rename-admin|reset-password|schema|status|start|stop|doctor|credentials|apply-ports|host-agent-install|host-agent-remove|host-scan|host-fix|host-fix-all|host-history) action=$1; shift ;;
+    --environment) environment=${2:?Missing environment}; shift 2 ;;
+    --install-dir) install_dir=${2:?Missing install directory}; shift 2 ;;
+    --upgrade) upgrade=true; shift ;;
+    --purge-data) purge_data=true; shift ;;
+    --no-start) no_start=true; shift ;;
+    --help|-h) echo 'Usage: manager.sh [menu|install|update|uninstall|info|rename-admin|reset-password|schema|status|start|stop|doctor|credentials|apply-ports|host-agent-install|host-agent-remove|host-scan|host-fix|host-fix-all|host-history] [--environment production|staging|development] [--install-dir /opt/ginkgo-waf] [--upgrade] [--purge-data] [--no-start]'; exit 0 ;;
+    *) fail "Unknown option: $1" ;;
+  esac
+done
+[[ $EUID -eq 0 ]] || fail '请使用root账号执行，或用sudo运行此脚本。'
+if $purge_data && [[ "$action" != menu && "$action" != install && "$action" != uninstall ]]; then
+  fail '--purge-data 只能用于 install 或 uninstall'
+fi
+case "$environment" in production|staging|development) ;; *) fail 'Invalid environment' ;; esac
+case "$(uname -s)/$(uname -m)" in Linux/x86_64|Linux/amd64) ;; *) fail '此安装包仅支持Linux x86_64/amd64' ;; esac
+if [[ "$action" == menu ]]; then
+  { exec 7<>/dev/tty; } 2>/dev/null || fail '菜单需要终端；自动化执行时请指定 install、update 等命令'
+  purge_data=false
+  printf '\nGinkgo WAF · %s · %s\n1. 全新安装\n2. 更新程序和数据库结构\n3. 卸载服务\n4. 查看信息\n5. 更改管理员账号\n6. 更改管理员密码\n7. 检查并更新已安装程序的数据库结构\n8. 主机安全（扫描、一键修复、主机代理）\n0. 退出\n' "$environment" "$install_dir" >&7
+  choose_key '请选择数字：' '|0|1|2|3|4|5|6|7|8|' || return 1
+  choice=$REPLY
+  case "$choice" in
+    8) action=host ;;
+    1) action=install ;;
+    2) action=update ;;
+    3) action=uninstall ;;
+    4) action=info ;;
+    5) action=rename-admin ;;
+    6) action=reset-password ;;
+    7) action=schema ;;
+    0) return 0 ;;
+    *) fail '无效的菜单选项' ;;
+  esac
+  if [[ "$choice" == 1 ]]; then
+    if retained_install; then
+      printf '\n检测到已保留的数据。\n1. 使用之前的数据\n2. 移除之前的数据并全新安装\n' >&7
+      choose_key '请选择数字：' '|1|2|' || return 1
+      if [[ "$REPLY" == 1 ]]; then
+        [[ -s "$install_dir/.runtime/$environment/.env" ]] || fail '运行配置已丢失，无法继续使用之前的数据。请改为全新安装。'
+        upgrade=true
+        printf '将使用之前的账号、密码和业务数据。\n' >&7
+      else
+        purge_data=true
+        upgrade=true
+        printf '将移除之前的账号、密码和业务数据，并重新生成。\n' >&7
+        prompt_admin_port 18000 || return 1
+        export UNITWAF_ADMIN_PORT=$REPLY
+      fi
+    else
+      if [[ -f "$install_dir/.unitwaf-install" && $(head -n 1 -- "$install_dir/.unitwaf-install") == UNIT_WAF_INSTALL_V1 ]]; then
+        upgrade=true
+        printf '将重新安装并生成新的账号和数据。\n' >&7
+      fi
+      if [[ ! -s "$install_dir/.runtime/$environment/.env" ]]; then
+        prompt_admin_port 18000 || return 1
+        export UNITWAF_ADMIN_PORT=$REPLY
+      fi
+    fi
+  fi
+  if [[ "$choice" == 3 ]]; then
+    printf '\n1. 保留数据与配置\n2. 移除所有数据\n' >&7
+    choose_key '请选择数字：' '|1|2|' || return 1
+    if [[ "$REPLY" == 2 ]]; then
+      purge_data=true
+      printf '将卸载服务，并移除账号、配置和业务数据。\n' >&7
+    else
+      printf '将卸载服务，账号、配置和业务数据会保留。\n' >&7
+    fi
+  fi
+  if [[ "$choice" == 2 ]]; then
+    printf '\n1. 增量更新（更新程序和数据库结构，不覆盖已有数据）\n2. 全量更新（更新完整环境包，不覆盖已有数据）\n' >&7
+    choose_key '请选择数字：' '|1|2|' || return 1
+    [[ "$REPLY" == 2 ]] && full_update=true
+  fi
+  if [[ "$choice" != 4 && "$choice" != 8 ]]; then
+    confirm '确认执行？' || return 0
+  fi
+fi
+[[ "$install_dir" == /* && "$install_dir" != / && "$install_dir" != /opt && "$install_dir" != /usr && "$install_dir" != /etc && "$install_dir" != /var && "$install_dir" != /home ]] || fail '请选择专属绝对安装目录，例如/opt/ginkgo-waf'
+[[ ! -L "$install_dir" ]] || fail '安装目录不能为符号链接'
+[[ $(readlink -m -- "$install_dir") == "$install_dir" ]] || fail '安装目录必须为规范路径，且不能经过符号链接'
+if [[ "$action" == install ]] && { ! command -v curl >/dev/null || ! command -v tar >/dev/null || ! command -v gzip >/dev/null || ! command -v flock >/dev/null || ! command -v find >/dev/null || [[ ! -s /etc/ssl/certs/ca-certificates.crt ]]; }; then
+  command -v apt-get >/dev/null || fail '自动补齐工具需要Ubuntu/Debian；其他系统请先安装curl、CA证书、tar、gzip、coreutils、util-linux'
+  export DEBIAN_FRONTEND=noninteractive
+  apt-get -o Acquire::Retries=3 -o DPkg::Lock::Timeout=120 update
+  apt-get -o Acquire::Retries=3 -o DPkg::Lock::Timeout=120 install -y --no-install-recommends curl ca-certificates tar gzip coreutils util-linux findutils
+fi
+exec 9>/run/unitwaf-install.lock
+flock -n 9 || fail '另一个 Ginkgo WAF 安装进程正在运行'
+# Never follow a user-controlled path when the manager is running as root.
+cursor=$install_dir
+while :; do
+  if [[ -e "$cursor" ]]; then
+    [[ -d "$cursor" && ! -L "$cursor" ]] || fail '安装路径不是普通目录'
+    read -r owner mode < <(stat -c '%u %a' -- "$cursor")
+    [[ "$owner" == 0 ]] && (( (8#$mode & 022) == 0 )) || fail "安装路径必须由root控制且其他账号不可写：$cursor"
+  fi
+  [[ "$cursor" != / ]] || break
+  cursor=$(dirname -- "$cursor")
+done
+[[ $(readlink -m -- "$install_dir") == "$install_dir" ]] || fail '安装路径经过符号链接'
+marker="$install_dir/.unitwaf-install"
+program_marker="$install_dir/.unitwaf-program"
+program_journal="$install_dir/.unitwaf-program-update"
+if [[ -d "$install_dir" && -n $(ls -A -- "$install_dir") ]]; then
+  [[ -f "$marker" && ! -L "$marker" ]] || fail '目录非空且不属于此安装器；请选择另一个--install-dir'
+  # volume-init 把 .runtime/<环境>/.env 交给容器用户 10001、权限 0600。这是运行时文件，允许它不是 root。
+  unsafe=$(find "$install_dir" \
+    \( -type l -o -perm /022 -o ! -uid 0 \) \
+    ! \( -type f -uid 10001 ! -perm /022 -path '*/.runtime/*/.env' \) \
+    -print -quit)
+  [[ -z "$unsafe" ]] || fail '安装目录包含符号链接、非root所有或可被其他账号修改的文件'
+  [[ $(head -n 1 -- "$marker") == UNIT_WAF_INSTALL_V1 ]] || fail '安装归属标记不匹配'
+  [[ $(sed -n '3p' -- "$marker") == "$environment" ]] || fail '此目录属于另一个环境，请为每个环境使用独立目录'
+fi
+if [[ "$action" != install && "$action" != update ]]; then
+  [[ -f "$marker" && $(sed -n '2p' -- "$marker") != pending ]] || fail '未发现完整安装，请先运行install'
+  [[ ! -f "$program_journal/ready.json" ]] || fail '检测到未完成的程序更新，请先执行 update'
+  if [[ "$action" == uninstall && "$purge_data" == true ]]; then
+    purge_environment_data
+    printf '卸载完成，数据已移除。\n'
+    return 0
+  fi
+  case "$action" in
+    host|host-*)
+      [[ -f "$install_dir/scripts/host_agent.sh" ]] || fail '请先从菜单选择 2 更新程序'
+      case "$action" in
+        host) host_menu ;;
+        host-agent-install) run_manage_host install ;;
+        host-agent-remove) run_manage_host remove ;;
+        host-scan) host_command scan ;;
+        host-fix) host_command fix --yes ;;
+        host-fix-all) host_command fix --all --yes ;;
+        host-history) host_command history ;;
+      esac
+      return
+      ;;
+  esac
+  manage=(bash "$install_dir/scripts/manage.sh" --environment "$environment" "$action")
+  if [[ ! -f "$program_marker" ]]; then
+    case "$action" in
+      rename-admin|schema) fail '请先从菜单选择 2 更新程序' ;;
+      info) manage=(bash "$install_dir/scripts/manage.sh" --environment "$environment" status) ;;
+      uninstall|reset-password)
+        runtime="$install_dir/.runtime/$environment/.env"
+        bash "$install_dir/scripts/check_project.sh" "$environment"
+        manage=(docker compose -p "unitwaf-$environment" --project-directory "$install_dir" --env-file "$runtime" -f "$install_dir/compose.yaml" -f "$install_dir/compose.bundle.yaml")
+        if [[ "$action" == uninstall ]]; then
+          manage+=(--profile '*' down --remove-orphans)
+        else
+          manage+=(exec -T admin ginkgo-waf reset-password)
+        fi
+        ;;
+    esac
+  fi
+  if [[ "$action" == rename-admin || "$action" == reset-password ]]; then
+    if [[ -n ${choice:-} ]]; then
+      if [[ "$action" == rename-admin ]]; then
+        read -r -p '输入新的管理员账号：' credential <&7
+      else
+        read -rs -p '输入新的管理员密码：' credential <&7; printf '\n' >&7
+        read -rs -p '再次输入密码：' repeated <&7; printf '\n' >&7
+        [[ "$credential" == "$repeated" ]] || fail '两次密码不同'
+      fi
+      printf '%s\n' "$credential" | "${manage[@]}"
+      return
+    fi
+  fi
+  exec "${manage[@]}"
+fi
+installed_sha=''
+if [[ -f "$marker" ]]; then
+  installed_sha=$(sed -n '2p' -- "$marker")
+fi
+program_update=false
+full_package=$PACKAGE
+full_checksum=$PACKAGE_SHA256
+if [[ "$action" == update && "$full_update" == false && -n "$PROGRAM_PACKAGE" ]]; then
+  program_update=true
+  [[ -n "$installed_sha" && "$installed_sha" != pending ]] || fail '请先完成全新安装'
+  [[ -s "$install_dir/.runtime/$environment/.env" && "$no_start" == false ]] || fail '程序更新需要已有运行配置并启动验证'
+  [[ ! -e "$install_dir/.unitwaf-update/ready" ]] || fail '请先用原入口恢复上次未完成的增量更新'
+  if [[ -f "$program_marker" && $(cat "$program_marker") == "$PROGRAM_SHA256" && ! -d "$program_journal" ]]; then
+    echo '已是最新程序。'; return 0
+  fi
+  PACKAGE="update/$PROGRAM_PACKAGE"
+  PACKAGE_SHA256="$PROGRAM_SHA256"
+elif [[ "$action" == update && "$full_update" == false ]]; then
+  [[ -n "$UPDATE_BASE" ]] || fail '请使用对应版本的独立更新入口'
+  [[ "$installed_sha" == "$UPDATE_BASE" || "$installed_sha" == "$UPDATE_TARGET" ]] || fail "起始版本不匹配。当前：${installed_sha:-未安装}，需要：$UPDATE_BASE"
+  [[ -s "$install_dir/.runtime/$environment/.env" ]] || fail '未找到已有运行配置，请先完成安装'
+  if [[ "$installed_sha" == "$UPDATE_TARGET" && ! -d "$install_dir/.unitwaf-update" ]]; then
+    echo '当前已是此更新包的目标版本。'
+    exit 0
+  fi
+  [[ "$no_start" == false ]] || fail '独立更新需要启动并验证服务'
+elif [[ "$action" == update && "$full_update" == true ]]; then
+  [[ -n "$installed_sha" && "$installed_sha" != pending ]] || fail '请先完成全新安装后再进行全量更新'
+  [[ -s "$install_dir/.runtime/$environment/.env" && "$no_start" == false ]] || fail '全量更新需要已有运行配置并启动验证'
+  upgrade=true
+else
+  [[ -z "$UPDATE_BASE" ]] || fail '这是独立更新入口，请使用完整安装入口安装'
+  [[ ! -e "$install_dir/.unitwaf-update/ready" ]] || fail '检测到未完成的独立更新，请先重跑原更新命令'
+  [[ ! -e "$program_journal/ready.json" ]] || fail '检测到未完成的程序更新，请先执行 update'
+  if [[ -n "$installed_sha" && "$installed_sha" != pending && "$installed_sha" != "$PACKAGE_SHA256" ]] && ! $upgrade; then
+    fail '此目录已安装另一修订包。请先备份，再显式使用--upgrade；数据和密码不会被重置。'
+  fi
+fi
+printf '\nGinkgo WAF · %s\n目标：%s  环境：%s\n' "$action" "$install_dir" "$environment"
+if [[ "$ALLOW_HTTP" == 1 ]]; then protocols='=http,https'; else protocols='=https'; fi
+[[ "$BASE_URL" == https://* || ( "$ALLOW_HTTP" == 1 && "$BASE_URL" == http://* ) ]] || fail '请先配置合法的发布地址'
+[[ "$BASE_URL" != *example.invalid* ]] || fail '发布地址还是示例。请在发布机配置实际下载地址。'
+workdir=$(mktemp -d /tmp/unitwaf-bootstrap.XXXXXXXX)
+fetch_package() {
+  local package=$1 checksum=$2 area="$workdir/$3"
+  mkdir -p "$area/unpacked"
+  printf '下载安装包：%s/%s\n' "$BASE_URL" "$package"
+  curl --fail --show-error --location --retry 3 --connect-timeout 15 --max-time 1800 \
+    --proto "$protocols" --proto-redir "$protocols" --output "$area/package.tar.gz" "$BASE_URL/$package"
+  printf '%s  %s\n' "$checksum" "$area/package.tar.gz" | sha256sum --check --status || { rm -f -- "$area/package.tar.gz"; fail 'SHA256不匹配；已删除下载文件，未解包、未执行安装'; }
+  tar -tzf "$area/package.tar.gz" > "$area/files"
+  awk -v root="$ARCHIVE_ROOT" '
+    $0 !~ ("^" root "/") {exit 1}
+    /(^|\/)\.\.(\/|$)/ || /(^|\/)\.runtime(\/|$)/ || /[[:space:]]/ || /\\/ {exit 1}
+  ' "$area/files" || fail '安装包包含非法路径'
+  tar -tvzf "$area/package.tar.gz" > "$area/types"
+  awk 'substr($1,1,1)!="-" && substr($1,1,1)!="d" {exit 1}' "$area/types" || fail '安装包不允许符号链接、硬链接或设备文件'
+  # Bind-mounted files must remain readable by the unprivileged container users.
+  (umask 022; tar --extract --gzip --file "$area/package.tar.gz" --directory "$area/unpacked" --no-same-owner --no-same-permissions)
+  rm -f -- "$area/package.tar.gz"
+  source_root="$area/unpacked/$ARCHIVE_ROOT"
+}
+fetch_package "$PACKAGE" "$PACKAGE_SHA256" initial
+if $program_update; then
+  [[ -f "$source_root/bin/ginkgo-waf" && -s "$source_root/schema.sql" && -f "$source_root/compose.bundle.yaml" ]] || fail '更新包缺少程序或数据库结构脚本'
+  old_bundle="$install_dir/bundle"
+  if [[ -f "$program_journal/ready.json" && -d "$program_journal/backup/bundle" ]]; then
+    old_bundle="$program_journal/backup/bundle"
+  fi
+  runtime_tag=$(tr -d '[:space:]' < "$old_bundle/image-tag")
+  [[ "$runtime_tag" =~ ^[0-9]+\.[0-9]+\.[0-9]+-[a-f0-9]{64}$ ]] || fail '无法识别已安装的容器环境'
+  previous_image_tag=$runtime_tag
+  flavor=production
+  [[ "$environment" != development ]] || flavor=development
+  app_image="ginkgo-bundle/app-$flavor:$runtime_tag"
+  helper="ginkgo-bundle/app-production:$runtime_tag"
+  bash "$source_root/scripts/install_images.sh" "$old_bundle"
+  # volume-init 把 .env 交给 uid 10001、权限 0600。这里以 root 运行但去掉了全部能力，需要 DAC_READ_SEARCH 才能读取它。
+  patch_program() {
+    docker run --rm --pull=never --network none --read-only --cap-drop ALL --cap-add DAC_READ_SEARCH --security-opt no-new-privileges:true --user 0:0 \
+      --mount "type=bind,source=$install_dir,target=/installed" \
+      --mount "type=bind,source=$source_root,target=/update,readonly" \
+      --mount "type=bind,source=$source_root/bin/ginkgo-waf,target=/usr/local/bin/ginkgo-waf,readonly" "$helper" \
+      ginkgo-waf program-update "$1" /installed /update "$environment" "$PROGRAM_SHA256" "${@:2}"
+  }
+  patch_program rollback
+  bash "$install_dir/scripts/check_project.sh" "$environment"
+  expected=$(sha256sum "$source_root/Dockerfile")
+  actual=$(docker run --rm --pull=never --network none --read-only --cap-drop ALL --security-opt no-new-privileges:true \
+    --entrypoint sha256sum "$app_image" /app/runtime-manifest)
+  runtime_change=()
+  if [[ "${actual%% *}" != "${expected%% *}" ]]; then
+    echo '已安装的容器运行环境与目标程序不同。可下载完整包，将运行环境切换到该版本验证过的镜像（可能升级或降级）。'
+    if ! $upgrade; then
+      { exec 7<>/dev/tty; } 2>/dev/null || fail '无人值守更新须显式指定 update --upgrade 才可更换运行环境'
+      confirm '下载完整包并更换运行环境？' || { echo '已取消运行环境切换。'; return 0; }
+    fi
+    small_root=$source_root
+    fetch_package "$full_package" "$full_checksum" runtime
+    cmp -s "$small_root/Dockerfile" "$source_root/Dockerfile" ||
+      fail '完整包和程序包的运行环境清单不一致'
+    check_database_runtime "$install_dir/bundle" "$source_root/bundle"
+    target_tag=$(tr -d '[:space:]' < "$source_root/bundle/image-tag")
+    loaded_update_tag=$target_tag
+    bash "$source_root/scripts/install_images.sh"
+    actual=$(docker run --rm --pull=never --network none --read-only --cap-drop ALL --security-opt no-new-privileges:true \
+      --entrypoint sha256sum "ginkgo-bundle/app-$flavor:$target_tag" /app/runtime-manifest)
+    [[ "${actual%% *}" == "${expected%% *}" ]] || fail '完整包内应用镜像的运行环境与目标程序不匹配'
+    runtime_change=("$full_checksum")
+  fi
+  run_manage() { bash "$install_dir/scripts/manage.sh" --environment "$environment" "$1"; }
+  if ! patch_program apply "${runtime_change[@]}"; then
+    patch_program rollback
+    fail '程序文件更新失败，已恢复旧程序'
+  fi
+  configured=true
+  if ((${#runtime_change[@]})); then
+    bash "$install_dir/install.sh" --environment "$environment" --prebuilt --no-start || configured=false
+  fi
+  if ! $configured || ! run_manage sync || ! run_manage check-ports; then
+    patch_program rollback
+    fail '更新预检失败。已恢复旧程序和运行配置，未执行数据库迁移或重启服务。'
+  fi
+  database_dump=$(mktemp /tmp/unitwaf-db.XXXXXXXX)
+  if ! database_save "$database_dump"; then
+    rm -f -- "$database_dump"
+    database_dump=''
+    patch_program rollback
+    fail '无法备份数据库，已中止更新，未改动数据库'
+  fi
+  if ! run_manage schema || ! run_manage start || ! run_manage smoke; then
+    patch_program rollback
+    if ! database_load "$database_dump"; then
+      printf '数据库未能退回更新前的内容。\n' >&2
+    fi
+    rm -f -- "$database_dump"
+    database_dump=''
+    if [[ -n "$loaded_update_tag" && "$loaded_update_tag" != "$previous_image_tag" ]]; then
+      remove_bundle_images "$loaded_update_tag"
+      loaded_update_tag=''
+    fi
+    if ! run_manage start; then
+      fail '已退回更新前的程序和配置，但旧服务启动失败。请排除上方错误后重试。'
+    fi
+    fail '更新验证失败，已退回更新前的程序、数据库、配置和镜像'
+  fi
+  rm -f -- "$database_dump"
+  database_dump=''
+  patch_program finish
+  if systemctl is-enabled --quiet ginkgo-waf-host-agent.service 2>/dev/null; then
+    run_manage_host install || printf '主机代理未能更新，可稍后在菜单「主机安全」中重新安装。\n' >&2
+  fi
+  echo '程序更新完成。'
+  return 0
+fi
+write_marker() {
+  local marker_temp
+  marker_temp=$(mktemp "$install_dir/.unitwaf-marker.XXXXXXXX")
+  printf 'UNIT_WAF_INSTALL_V1\n%s\n%s\n' "$1" "$environment" > "$marker_temp"
+  mv -f -- "$marker_temp" "$marker"
+}
+if [[ "$action" == update && "$full_update" == false ]]; then
+  [[ -f "$source_root/apply" && -f "$source_root/manifest.json" ]] || fail '更新包缺少必要文件'
+  bash "$install_dir/scripts/check_project.sh" "$environment"
+  # The helper image is pinned by the already installed image inventory; the payload brings its own applier.
+  inventory="$install_dir/bundle/images.list"
+  if [[ "$installed_sha" == "$UPDATE_BASE" && -f "$install_dir/.unitwaf-update/ready" && -f "$install_dir/.unitwaf-update/backup/bundle/images.list" ]]; then
+    inventory="$install_dir/.unitwaf-update/backup/bundle/images.list"
+  fi
+  read -r helper helper_id < <(awk '$1 ~ /^ginkgo-bundle\/app-production:/ {print $1, $2}' "$inventory")
+  [[ "$helper" =~ ^ginkgo-bundle/app-production:[0-9]+\.[0-9]+\.[0-9]+-[a-f0-9]{64}$ && "$helper_id" =~ ^sha256:[a-f0-9]{64}$ ]] || fail '本地应用镜像清单无效'
+  [[ $(image_runtime_id "$helper") == "$helper_id" ]] || fail '本地应用镜像缺失或不匹配'
+  patch_files() {
+    docker run --rm --pull=never --network none --read-only --cap-drop ALL --cap-add DAC_READ_SEARCH --security-opt no-new-privileges:true --user 0:0 \
+      --mount "type=bind,source=$install_dir,target=/installed" \
+      --mount "type=bind,source=$source_root,target=/update,readonly" \
+      --mount "type=bind,source=$source_root/apply,target=/usr/local/bin/ginkgo-waf,readonly" "$helper" \
+      ginkgo-waf incremental "$1" /installed /update "$environment" "$UPDATE_BASE" "$UPDATE_TARGET"
+  }
+  if [[ "$installed_sha" != "$UPDATE_TARGET" ]]; then
+    patch_files rollback
+    if ! patch_files apply; then
+      patch_files rollback
+      fail '补丁未能应用，原版本仍可使用'
+    fi
+    if ! (umask 022; bash "$install_dir/install.sh" --environment "$environment" --prebuilt); then
+      patch_files rollback
+      bash "$install_dir/scripts/manage.sh" --environment "$environment" start
+      fail '更新验证失败，已恢复更新前的应用文件和配置'
+    fi
+    write_marker "$UPDATE_TARGET"
+  fi
+  patch_files finish
+  echo '独立更新完成。'
+  exit 0
+fi
+[[ -f "$source_root/install.sh" && -f "$source_root/bundle/images.tar" && -f "$source_root/bundle/images.list" && -f "$source_root/bundle/image-tag" ]] || fail '完整镜像安装包缺少必要文件'
+if $purge_data; then
+  echo '正在移除之前的数据。'
+  purge_environment_data
+fi
+if [[ -n "$installed_sha" && "$installed_sha" != pending && "$purge_data" == false ]]; then
+  check_database_runtime "$install_dir/bundle" "$source_root/bundle"
+fi
+kept_runtime=false
+[[ -s "$install_dir/.runtime/$environment/.env" ]] && kept_runtime=true
+staged_fresh=true
+if [[ "$kept_runtime" == true ]]; then
+  [[ -f "$install_dir/bundle/image-tag" ]] && previous_image_tag=$(tr -d '[:space:]' < "$install_dir/bundle/image-tag")
+  rollback_dir=$(mktemp -d /tmp/unitwaf-rollback.XXXXXXXX)
+  cp -a "$install_dir/." "$rollback_dir/" || { rm -rf -- "$rollback_dir"; rollback_dir=''; fail '无法保存更新前的安装文件，已中止'; }
+fi
+mkdir -p -- "$install_dir"
+chmod 0700 -- "$source_root" "$install_dir"
+if [[ ! -f "$marker" ]]; then printf 'UNIT_WAF_INSTALL_V1\npending\n%s\n' "$environment" > "$marker"; fi
+cp -a -- "$source_root/." "$install_dir/"
+if [[ -n "$PROGRAM_PACKAGE" ]]; then printf '%s\n' "$PROGRAM_SHA256" > "$program_marker"; fi
+write_marker "$PACKAGE_SHA256"
+args=(--environment "$environment" --prebuilt)
+if $no_start; then args+=(--no-start); fi
+bash "$install_dir/install.sh" "${args[@]}"
+if $full_update; then
+  echo '正在按更新包核对数据库结构，已有数据会保留。'
+  bash "$install_dir/scripts/manage.sh" --environment "$environment" schema
+fi
+printf '\n安装目录：%s\n请妥善保存上方显示的账号密码。\n' "$install_dir"
+}
+main "$@"
