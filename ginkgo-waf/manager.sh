@@ -325,25 +325,67 @@ confirm() {
   done
 }
 
+remember_port_holder() {
+  local name=$1 pid=$2
+  [[ "$name" =~ ^[A-Za-z0-9_.:@+-]+$ && "$pid" =~ ^[0-9]+$ ]] || return 0
+  [[ " $PORT_HOLDER_NAMES " == *" $name "* ]] && return 0
+  PORT_HOLDER_NAMES+=" $name"
+  if [[ -n "$PORT_HOLDERS" ]]; then PORT_HOLDERS+="、"; fi
+  PORT_HOLDERS+="$name（$pid）"
+}
+collect_port_holders() {
+  local line=$1 rest name pid
+  rest=$line
+  while [[ "$rest" =~ \"([^\"]+)\",pid=([0-9]+) ]]; do
+    name=${BASH_REMATCH[1]}
+    pid=${BASH_REMATCH[2]}
+    remember_port_holder "$name" "$pid"
+    rest=${rest#*"pid=$pid"}
+  done
+}
+proc_port_holders() {
+  local port=$1 hex inode process fd target comm
+  hex=$(printf '%04X' "$port")
+  while read -r inode; do
+    [[ "$inode" =~ ^[0-9]+$ ]] || continue
+    for fd in /proc/[0-9]*/fd/*; do
+      target=$(readlink -- "$fd" 2>/dev/null || true)
+      [[ "$target" == "socket:[$inode]" ]] || continue
+      process=${fd#/proc/}
+      process=${process%%/*}
+      comm=$(tr -d '\0' < "/proc/$process/comm" 2>/dev/null || true)
+      remember_port_holder "$comm" "$process"
+    done
+  done < <(awk -v suffix=":$hex" 'toupper($2) ~ suffix "$" && $4 == "0A" { print $10 }' /proc/net/tcp /proc/net/tcp6 2>/dev/null || true)
+}
 port_in_use() {
-  local port=$1 listing='' line local_address current
+  local port=$1 listing='' line local_address current found=false
+  PORT_HOLDERS=''
+  PORT_HOLDER_NAMES=''
   if [[ -n "${UNITWAF_PORT_LISTENERS:-}" ]]; then
     listing=$(cat -- "$UNITWAF_PORT_LISTENERS")
   elif command -v ss >/dev/null 2>&1; then
-    listing=$(ss -H -ltn 2>/dev/null || true)
+    listing=$(ss -H -ltnp "sport = :$port" 2>/dev/null || true)
   else
-    awk -v port="$port" 'BEGIN { p = sprintf("%04X", port) }
-      $4 == "0A" && toupper($2) ~ ":" p "$" { found = 1 }
-      END { exit !found }' /proc/net/tcp /proc/net/tcp6 2>/dev/null
-    return
+    proc_port_holders "$port"
+    if [[ -n "$PORT_HOLDERS" ]]; then return 0; fi
+    return 1
   fi
   while IFS= read -r line; do
     [[ -n "$line" ]] || continue
     read -r _ _ _ local_address _ <<< "$line"
     current=${local_address##*:}
-    [[ "$current" == "$port" ]] && return 0
+    [[ "$current" == "$port" ]] || continue
+    found=true
+    collect_port_holders "$line"
   done <<< "$listing"
-  return 1
+  if [[ "$found" == false ]]; then
+    return 1
+  fi
+  if [[ -z "$PORT_HOLDERS" && -d /proc/net ]]; then
+    proc_port_holders "$port"
+  fi
+  return 0
 }
 
 prompt_port() {
@@ -365,7 +407,11 @@ prompt_port() {
       continue
     fi
     if port_in_use "$current"; then
-      prompt_out $'端口已被其它应用占用，请更换端口。\n'
+      if [[ -n "$PORT_HOLDERS" ]]; then
+        prompt_out "端口 ${current} 已被 ${PORT_HOLDERS} 占用，请更换端口。"$'\n'
+      else
+        prompt_out "端口 ${current} 已被其它应用占用，请更换端口。"$'\n'
+      fi
       continue
     fi
     REPLY=$current
